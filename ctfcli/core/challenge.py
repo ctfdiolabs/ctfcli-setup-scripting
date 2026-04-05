@@ -1,9 +1,11 @@
 import logging
 import re
 import subprocess
+import tempfile
 from os import PathLike
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import click
 import yaml
@@ -19,6 +21,7 @@ from ctfcli.core.exceptions import (
     RemoteChallengeNotFound,
 )
 from ctfcli.core.image import Image
+from ctfcli.core.lfs import fetch_artifact
 from ctfcli.utils.hashing import hash_file
 from ctfcli.utils.tools import strings
 
@@ -55,6 +58,7 @@ class Challenge(dict):
         "protocol",
         "host",
         "connection_info",
+        "lfs",
         "healthcheck",
         "solution",
         "attempts",
@@ -64,6 +68,7 @@ class Challenge(dict):
         "topics",
         "tags",
         "files",
+        "lfs",
         "hints",
         "requirements",
         "next",
@@ -127,7 +132,7 @@ class Challenge(dict):
         if key == "type" and value == "standard":
             return True
 
-        if key in ["tags", "hints", "topics", "requirements", "files"] and value == []:
+        if key in ["tags", "hints", "topics", "requirements", "files", "lfs"] and value == []:
             return True
 
         if key == "requirements" and value == {"prerequisites": [], "anonymize": False}:
@@ -289,6 +294,127 @@ class Challenge(dict):
         for challenge_file in files:
             if not (self.challenge_directory / challenge_file).exists():
                 raise InvalidChallengeFile(f"File {challenge_file} could not be loaded")
+
+    def _validate_lfs_definition(self):
+        lfs_artifacts = self.get("lfs") or []
+        if not lfs_artifacts:
+            return
+
+        if type(lfs_artifacts) is not list:
+            raise InvalidChallengeFile("The lfs field must be a list")
+
+        lfs_root = (self.challenge_directory / "lfs").resolve()
+        for artifact in lfs_artifacts:
+            if type(artifact) is not dict:
+                raise InvalidChallengeFile("Each lfs entry must be an object with path and source")
+
+            path = artifact.get("path")
+            source = artifact.get("source")
+            sha256 = artifact.get("sha256")
+
+            if type(path) is not str or not path.strip():
+                raise InvalidChallengeFile("Each lfs entry must define a non-empty string path")
+
+            artifact_path = Path(path)
+            if artifact_path.is_absolute():
+                raise InvalidChallengeFile(f"Invalid lfs path '{path}': absolute paths are not allowed")
+
+            resolved = (self.challenge_directory / "lfs" / artifact_path).resolve()
+            if lfs_root != resolved and lfs_root not in resolved.parents:
+                raise InvalidChallengeFile(f"Invalid lfs path '{path}': path escapes lfs directory")
+
+            if type(source) is not str or not source.strip():
+                raise InvalidChallengeFile("Each lfs entry must define a non-empty string source")
+
+            scheme = urlparse(source).scheme
+            if scheme not in ["http", "https"]:
+                raise InvalidChallengeFile(f"Unsupported lfs source scheme '{scheme}' for path '{path}'")
+
+            if sha256 is not None:
+                if type(sha256) is not str or re.fullmatch(r"[a-fA-F0-9]{64}", sha256) is None:
+                    raise InvalidChallengeFile(
+                        f"Invalid sha256 digest for lfs path '{path}': expected a 64-character hex string"
+                    )
+
+    def _ensure_lfs_gitignore(self):
+        if not self.get("lfs"):
+            return
+
+        gitignore_rule = "/lfs/**"
+        gitignore_path = self.challenge_directory / ".gitignore"
+
+        if gitignore_path.exists():
+            existing_lines = gitignore_path.read_text().splitlines()
+        else:
+            existing_lines = []
+
+        if gitignore_rule not in existing_lines:
+            with open(gitignore_path, "a") as gitignore:
+                if existing_lines and existing_lines[-1].strip() != "":
+                    gitignore.write("\n")
+                gitignore.write(f"{gitignore_rule}\n")
+
+            is_git_repo = subprocess.call(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=self.challenge_directory,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if is_git_repo == 0:
+                subprocess.call(
+                    ["git", "add", ".gitignore"],
+                    cwd=self.challenge_directory,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+    def _materialize_lfs(self):
+        lfs_artifacts = self.get("lfs") or []
+        if not lfs_artifacts:
+            return
+
+        self._validate_lfs_definition()
+        self._ensure_lfs_gitignore()
+
+        for artifact in lfs_artifacts:
+            path = artifact["path"]
+            source = artifact["source"]
+            expected_sha256 = artifact.get("sha256")
+
+            destination = self.challenge_directory / "lfs" / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+            if destination.exists() and expected_sha256 is not None:
+                with open(destination, "rb") as existing_file:
+                    existing_sha256 = hash_file(existing_file, "sha256")
+
+                if existing_sha256.lower() == expected_sha256.lower():
+                    continue
+
+            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as tmp:
+                temp_path = Path(tmp.name)
+
+            try:
+                fetch_artifact(source, temp_path)
+
+                if expected_sha256 is not None:
+                    with open(temp_path, "rb") as downloaded_file:
+                        downloaded_sha256 = hash_file(downloaded_file, "sha256")
+
+                    if downloaded_sha256.lower() != expected_sha256.lower():
+                        raise InvalidChallengeFile(
+                            f"sha256 mismatch for lfs path '{path}': expected {expected_sha256}, got {downloaded_sha256}"
+                        )
+
+                temp_path.replace(destination)
+            except Exception as e:
+                if temp_path.exists():
+                    temp_path.unlink()
+
+                if isinstance(e, InvalidChallengeFile):
+                    raise
+
+                raise InvalidChallengeFile(f"Could not materialize lfs file '{path}' from '{source}': {e}") from e
 
     def _get_initial_challenge_payload(self, ignore: tuple[str] = ()) -> dict:
         challenge = self
@@ -895,6 +1021,9 @@ class Challenge(dict):
         if not self.get("name"):
             raise InvalidChallengeFile("Challenge does not provide a name")
 
+        if "lfs" not in ignore:
+            self._materialize_lfs()
+
         if challenge.get("files", False) and "files" not in ignore:
             # _validate_files will raise if file is not found
             self._validate_files()
@@ -1035,6 +1164,9 @@ class Challenge(dict):
 
         if not challenge.get("value", False) and challenge.get("type", "standard") != "dynamic":
             raise InvalidChallengeDefinition("Challenge does not provide a value")
+
+        if "lfs" not in ignore:
+            self._materialize_lfs()
 
         if challenge.get("files", False) and "files" not in ignore:
             # _validate_files will raise if file is not found
@@ -1187,6 +1319,11 @@ class Challenge(dict):
                     issues["files"].append(
                         f"Solution file '{solution_file}' specified, but not found at {solution_file_path}"
                     )
+
+        try:
+            self._validate_lfs_definition()
+        except InvalidChallengeFile as e:
+            issues["fields"].append(str(e))
 
         # Check that files don't have a flag in them
         for challenge_file in files:

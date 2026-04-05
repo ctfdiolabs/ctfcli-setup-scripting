@@ -48,6 +48,17 @@ connection_info: nc hostname 12345
 # ./writeup/exploit.sh --connection-info "nc hostname 12345"
 healthcheck: writeup/exploit.sh
 
+# lfs can be used to materialize large files under the local ./lfs directory before install/sync
+# each path is relative to ./lfs
+# only http/https sources are supported in v1
+# if sha256 is provided it will be verified after download
+# lfs:
+#   - path: big-file-1.bin
+#     source: https://downloads.invalid/big-file-1.bin
+#     sha256: "optional 64-char hex digest"
+#   - path: models/model.gguf
+#     source: https://downloads.invalid/model.gguf
+
 # solution is used to provide a path to the challenge solution document.
 # The file path is relative to this challenge.yml file.
 # If provided as a string path, ctfcli uploads it as a hidden CTFd solution during sync.

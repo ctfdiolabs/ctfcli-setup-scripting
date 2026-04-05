@@ -1,5 +1,7 @@
 import re
+import tempfile
 import unittest
+from hashlib import sha256
 from pathlib import Path
 from unittest import mock
 from unittest.mock import ANY, MagicMock, call, mock_open
@@ -1887,6 +1889,264 @@ class TestLintChallenge(unittest.TestCase):
         }
 
         self.assertDictEqual(expected_lint_issues, e.exception.issues)
+
+
+class TestLFSChallenge(unittest.TestCase):
+    minimal_challenge = BASE_DIR / "fixtures" / "challenges" / "test-challenge-minimal" / "challenge.yml"
+
+    @staticmethod
+    def _create_temp_challenge_with_lfs(lfs):
+        tmp = tempfile.TemporaryDirectory()
+        challenge_dir = Path(tmp.name)
+        challenge_path = challenge_dir / "challenge.yml"
+
+        challenge_path.write_text(
+            yaml.safe_dump(
+                {
+                    "name": "LFS Challenge",
+                    "author": "Test",
+                    "category": "Test",
+                    "description": "desc",
+                    "attribution": "attr",
+                    "value": 100,
+                    "type": "standard",
+                    "lfs": lfs,
+                }
+            )
+        )
+
+        return tmp, challenge_path
+
+    @mock.patch("ctfcli.core.challenge.subprocess.call", return_value=1)
+    def test_materializes_lfs_file_from_http_source(self, _mock_subprocess_call: MagicMock):
+        tmp, challenge_path = self._create_temp_challenge_with_lfs(
+            [{"path": "models/model.bin", "source": "https://downloads.invalid/model.bin"}]
+        )
+        self.addCleanup(tmp.cleanup)
+        challenge = Challenge(challenge_path)
+
+        def fake_fetch(source, destination):
+            self.assertEqual(source, "https://downloads.invalid/model.bin")
+            destination.write_bytes(b"test-content")
+
+        with mock.patch("ctfcli.core.challenge.fetch_artifact", side_effect=fake_fetch):
+            challenge._materialize_lfs()
+
+        self.assertEqual((challenge.challenge_directory / "lfs" / "models/model.bin").read_bytes(), b"test-content")
+        self.assertEqual((challenge.challenge_directory / ".gitignore").read_text().strip(), "/lfs/**")
+
+    @mock.patch("ctfcli.core.challenge.subprocess.call", return_value=1)
+    def test_fails_on_lfs_sha256_mismatch(self, _mock_subprocess_call: MagicMock):
+        tmp, challenge_path = self._create_temp_challenge_with_lfs(
+            [
+                {
+                    "path": "big-file.bin",
+                    "source": "https://downloads.invalid/big-file.bin",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            ]
+        )
+        self.addCleanup(tmp.cleanup)
+        challenge = Challenge(challenge_path)
+
+        with mock.patch("ctfcli.core.challenge.fetch_artifact", side_effect=lambda _s, d: d.write_bytes(b"content")):
+            with self.assertRaises(InvalidChallengeFile):
+                challenge._materialize_lfs()
+
+    @mock.patch("ctfcli.core.challenge.subprocess.call", return_value=1)
+    def test_skips_download_when_existing_file_matches_sha256(self, _mock_subprocess_call: MagicMock):
+        content = b"existing-content"
+        digest = sha256(content).hexdigest()
+
+        tmp, challenge_path = self._create_temp_challenge_with_lfs(
+            [
+                {
+                    "path": "big-file.bin",
+                    "source": "https://downloads.invalid/big-file.bin",
+                    "sha256": digest,
+                }
+            ]
+        )
+        self.addCleanup(tmp.cleanup)
+        challenge = Challenge(challenge_path)
+
+        destination = challenge.challenge_directory / "lfs" / "big-file.bin"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+
+        with mock.patch("ctfcli.core.challenge.fetch_artifact") as mock_fetch_artifact:
+            challenge._materialize_lfs()
+
+        mock_fetch_artifact.assert_not_called()
+        self.assertEqual(destination.read_bytes(), content)
+
+    def test_rejects_invalid_lfs_paths(self):
+        challenge = Challenge(self.minimal_challenge, {"lfs": [{"path": "../outside.bin", "source": "https://x"}]})
+        with self.assertRaises(InvalidChallengeFile):
+            challenge._validate_lfs_definition()
+
+        challenge = Challenge(self.minimal_challenge, {"lfs": [{"path": "/tmp/outside.bin", "source": "https://x"}]})
+        with self.assertRaises(InvalidChallengeFile):
+            challenge._validate_lfs_definition()
+
+    def test_rejects_unknown_lfs_scheme(self):
+        challenge = Challenge(self.minimal_challenge, {"lfs": [{"path": "a.bin", "source": "s3://bucket/key"}]})
+        with self.assertRaises(InvalidChallengeFile):
+            challenge._validate_lfs_definition()
+
+    def test_rejects_invalid_lfs_sha256_format(self):
+        challenge = Challenge(
+            self.minimal_challenge,
+            {"lfs": [{"path": "a.bin", "source": "https://downloads.invalid/a.bin", "sha256": "not-a-hash"}]},
+        )
+        with self.assertRaises(InvalidChallengeFile):
+            challenge._validate_lfs_definition()
+
+    def test_lint_reports_invalid_lfs(self):
+        challenge = Challenge(self.minimal_challenge, {"lfs": [{"path": "../x", "source": "https://downloads.invalid/x"}]})
+        with self.assertRaises(LintException) as e:
+            challenge.lint(skip_hadolint=True)
+
+        self.assertTrue(any("path escapes lfs directory" in issue for issue in e.exception.issues["fields"]))
+
+    def test_create_runs_lfs_materialization_before_file_validation(self):
+        challenge = Challenge(
+            self.minimal_challenge,
+            {
+                "lfs": [{"path": "a.bin", "source": "https://downloads.invalid/a.bin"}],
+                "files": ["files/nonexistent.bin"],
+            },
+        )
+        call_order = []
+
+        challenge._materialize_lfs = lambda: call_order.append("lfs")
+
+        def stop_after_validate():
+            call_order.append("files")
+            raise InvalidChallengeFile("stop")
+
+        challenge._validate_files = stop_after_validate
+
+        with self.assertRaises(InvalidChallengeFile):
+            challenge.create()
+
+        self.assertEqual(call_order, ["lfs", "files"])
+
+    def test_sync_runs_lfs_materialization_before_file_validation(self):
+        challenge = Challenge(
+            self.minimal_challenge,
+            {
+                "lfs": [{"path": "a.bin", "source": "https://downloads.invalid/a.bin"}],
+                "files": ["files/nonexistent.bin"],
+            },
+        )
+        call_order = []
+
+        challenge._materialize_lfs = lambda: call_order.append("lfs")
+
+        def stop_after_validate():
+            call_order.append("files")
+            raise InvalidChallengeFile("stop")
+
+        challenge._validate_files = stop_after_validate
+
+        with self.assertRaises(InvalidChallengeFile):
+            challenge.sync()
+
+        self.assertEqual(call_order, ["lfs", "files"])
+
+    @mock.patch("ctfcli.core.challenge.subprocess.call")
+    def test_stages_lfs_gitignore_if_inside_git_repo(self, mock_subprocess_call: MagicMock):
+        tmp, challenge_path = self._create_temp_challenge_with_lfs(
+            [{"path": "big-file.bin", "source": "https://downloads.invalid/big-file.bin"}]
+        )
+        self.addCleanup(tmp.cleanup)
+        challenge = Challenge(challenge_path)
+
+        mock_subprocess_call.side_effect = [0, 0]
+
+        with mock.patch("ctfcli.core.challenge.fetch_artifact", side_effect=lambda _s, d: d.write_bytes(b"content")):
+            challenge._materialize_lfs()
+
+        self.assertEqual(
+            mock_subprocess_call.call_args_list,
+            [
+                call(
+                    ["git", "rev-parse", "--is-inside-work-tree"],
+                    cwd=challenge.challenge_directory,
+                    stdout=ANY,
+                    stderr=ANY,
+                ),
+                call(
+                    ["git", "add", ".gitignore"],
+                    cwd=challenge.challenge_directory,
+                    stdout=ANY,
+                    stderr=ANY,
+                ),
+            ],
+        )
+
+    @mock.patch("ctfcli.core.challenge.subprocess.call", return_value=1)
+    def test_gitignore_rule_is_idempotent(self, _mock_subprocess_call: MagicMock):
+        tmp, challenge_path = self._create_temp_challenge_with_lfs(
+            [{"path": "big-file.bin", "source": "https://downloads.invalid/big-file.bin"}]
+        )
+        self.addCleanup(tmp.cleanup)
+        challenge = Challenge(challenge_path)
+
+        challenge._ensure_lfs_gitignore()
+        challenge._ensure_lfs_gitignore()
+
+        gitignore_lines = (challenge.challenge_directory / ".gitignore").read_text().splitlines()
+        self.assertEqual(gitignore_lines.count("/lfs/**"), 1)
+
+    @mock.patch("ctfcli.core.challenge.subprocess.call", return_value=1)
+    def test_gitignore_preserves_existing_content_and_appends_rule(self, _mock_subprocess_call: MagicMock):
+        tmp, challenge_path = self._create_temp_challenge_with_lfs(
+            [{"path": "big-file.bin", "source": "https://downloads.invalid/big-file.bin"}]
+        )
+        self.addCleanup(tmp.cleanup)
+        challenge = Challenge(challenge_path)
+
+        gitignore_path = challenge.challenge_directory / ".gitignore"
+        gitignore_path.write_text("# existing\n\n*.tmp\n")
+
+        challenge._ensure_lfs_gitignore()
+
+        gitignore_contents = gitignore_path.read_text()
+        self.assertIn("# existing\n\n*.tmp\n", gitignore_contents)
+        self.assertTrue(gitignore_contents.endswith("/lfs/**\n"))
+        self.assertEqual(gitignore_contents.splitlines().count("/lfs/**"), 1)
+
+    def test_create_ignores_lfs_materialization_when_ignored(self):
+        challenge = Challenge(
+            self.minimal_challenge,
+            {
+                "lfs": [{"path": "a.bin", "source": "https://downloads.invalid/a.bin"}],
+                "files": ["files/nonexistent.bin"],
+            },
+        )
+        challenge._materialize_lfs = MagicMock()
+
+        with self.assertRaises(InvalidChallengeFile):
+            challenge.create(ignore=["lfs"])
+
+        challenge._materialize_lfs.assert_not_called()
+
+    def test_sync_ignores_lfs_materialization_when_ignored(self):
+        challenge = Challenge(
+            self.minimal_challenge,
+            {
+                "lfs": [{"path": "a.bin", "source": "https://downloads.invalid/a.bin"}],
+                "files": ["files/nonexistent.bin"],
+            },
+        )
+        challenge._materialize_lfs = MagicMock()
+
+        with self.assertRaises(InvalidChallengeFile):
+            challenge.sync(ignore=["lfs"])
+
+        challenge._materialize_lfs.assert_not_called()
 
 
 class TestVerifyMirrorChallenge(unittest.TestCase):

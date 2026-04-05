@@ -1,0 +1,11 @@
+name: Test Challenge LFS
+author: Test
+category: Test
+description: Test Description
+attribution: Test Attribution
+value: 100
+type: standard
+
+lfs:
+  - path: big-file.bin
+    source: https://downloads.invalid/big-file.bin
