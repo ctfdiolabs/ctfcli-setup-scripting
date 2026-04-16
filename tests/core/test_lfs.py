@@ -5,6 +5,10 @@ from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
+from botocore import UNSIGNED
+from botocore.config import Config
+from botocore.exceptions import NoCredentialsError
+
 from ctfcli.core.lfs import HttpArtifactHandler, S3ArtifactHandler, fetch_artifact
 
 
@@ -147,6 +151,45 @@ class TestS3ArtifactHandler(unittest.TestCase):
             s3_client.get_object.assert_called_once_with(Bucket="my-bucket", Key="path/to/object.bin")
             body.read.assert_has_calls([mock.call(3), mock.call(3), mock.call(3)])
             self.assertEqual(destination.read_bytes(), b"abcdef")
+
+    @mock.patch("ctfcli.core.lfs.import_module")
+    def test_retries_public_s3_without_credentials_using_unsigned_requests(
+        self, mock_import_module: mock.MagicMock
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "artifact.bin"
+
+            body = mock.MagicMock()
+            body.read.side_effect = [b"abc", b""]
+
+            signed_client = mock.MagicMock()
+            signed_client.get_object.side_effect = NoCredentialsError()
+
+            unsigned_client = mock.MagicMock()
+            unsigned_client.get_object.return_value = {"Body": body, "ContentLength": 3}
+
+            boto3 = mock.MagicMock()
+            boto3.client.side_effect = [signed_client, unsigned_client]
+            mock_import_module.return_value = boto3
+
+            S3ArtifactHandler.fetch("s3://openalex/README.txt", destination)
+
+            mock_import_module.assert_called_once_with("boto3")
+            self.assertEqual(boto3.client.call_count, 2)
+            boto3.client.assert_has_calls(
+                [
+                    mock.call("s3"),
+                    mock.call("s3", config=mock.ANY),
+                ]
+            )
+            signed_client.get_object.assert_called_once_with(Bucket="openalex", Key="README.txt")
+            unsigned_client.get_object.assert_called_once_with(Bucket="openalex", Key="README.txt")
+
+            config = boto3.client.call_args_list[1].kwargs["config"]
+            self.assertIsInstance(config, Config)
+            self.assertEqual(config.signature_version, UNSIGNED)
+            body.read.assert_has_calls([mock.call(1024 * 1024), mock.call(1024 * 1024)])
+            self.assertEqual(destination.read_bytes(), b"abc")
 
     @mock.patch("ctfcli.core.lfs.import_module", side_effect=ModuleNotFoundError("boto3"))
     def test_errors_if_boto3_is_missing(self, _mock_import_module: mock.MagicMock):

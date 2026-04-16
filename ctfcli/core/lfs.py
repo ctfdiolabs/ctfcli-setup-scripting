@@ -8,6 +8,9 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import click
+from botocore import UNSIGNED
+from botocore.config import Config
+from botocore.exceptions import NoCredentialsError
 
 
 class ArtifactHandler(ABC):
@@ -131,7 +134,12 @@ class S3ArtifactHandler(ArtifactHandler):
             raise RuntimeError("Could not import boto3. Install ctfcli with boto3 support.") from e
 
         s3 = boto3.client("s3")
-        response = s3.get_object(Bucket=bucket, Key=key)
+        try:
+            response = s3.get_object(Bucket=bucket, Key=key)
+        except NoCredentialsError:
+            # Public S3 buckets should still be readable without AWS credentials.
+            s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+            response = s3.get_object(Bucket=bucket, Key=key)
         body = response["Body"]
         total_size = response.get("ContentLength")
         chunk_size = max(S3ArtifactHandler._get_env_int("CTFCLI_LFS_S3_CHUNK_SIZE", 1024 * 1024), 1)
