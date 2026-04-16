@@ -6,6 +6,7 @@
 
 - Add support for branches to challenge repo URLs
 - Add support for solutions based on writeups in the challenge repo
+- Add `lfs` challenge artifacts with `http` / `https` / `s3` sources, optional `sha256` validation, and streamed downloads during install/sync
 
 # 0.1.6 / 2026-01-06
 

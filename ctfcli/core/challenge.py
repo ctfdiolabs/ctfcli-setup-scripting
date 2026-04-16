@@ -327,7 +327,7 @@ class Challenge(dict):
                 raise InvalidChallengeFile("Each lfs entry must define a non-empty string source")
 
             scheme = urlparse(source).scheme
-            if scheme not in ["http", "https"]:
+            if scheme not in ["http", "https", "s3"]:
                 raise InvalidChallengeFile(f"Unsupported lfs source scheme '{scheme}' for path '{path}'")
 
             if sha256 is not None:

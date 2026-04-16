@@ -1989,8 +1989,12 @@ class TestLFSChallenge(unittest.TestCase):
         with self.assertRaises(InvalidChallengeFile):
             challenge._validate_lfs_definition()
 
-    def test_rejects_unknown_lfs_scheme(self):
+    def test_accepts_s3_lfs_scheme(self):
         challenge = Challenge(self.minimal_challenge, {"lfs": [{"path": "a.bin", "source": "s3://bucket/key"}]})
+        challenge._validate_lfs_definition()
+
+    def test_rejects_unknown_lfs_scheme(self):
+        challenge = Challenge(self.minimal_challenge, {"lfs": [{"path": "a.bin", "source": "ftp://bucket/key"}]})
         with self.assertRaises(InvalidChallengeFile):
             challenge._validate_lfs_definition()
 

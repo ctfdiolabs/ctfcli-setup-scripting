@@ -1,6 +1,7 @@
 import os
 import time
 from abc import ABC, abstractmethod
+from importlib import import_module
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -95,8 +96,65 @@ class HttpArtifactHandler(ArtifactHandler):
             time.sleep(retry_backoff)
 
 
+class S3ArtifactHandler(ArtifactHandler):
+    @staticmethod
+    def _get_env_int(name: str, default: int) -> int:
+        value = os.getenv(name)
+        if value is None:
+            return default
+
+        try:
+            parsed = int(value)
+            if parsed < 0:
+                return default
+            return parsed
+        except ValueError:
+            return default
+
+    @staticmethod
+    def supports(source: str) -> bool:
+        parsed = urlparse(source)
+        return parsed.scheme == "s3"
+
+    @staticmethod
+    def fetch(source: str, destination: Path) -> None:
+        parsed = urlparse(source)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+
+        if not bucket or not key:
+            raise ValueError(f"Invalid s3 source '{source}': expected s3://<bucket>/<key>")
+
+        try:
+            boto3 = import_module("boto3")
+        except ModuleNotFoundError as e:
+            raise RuntimeError("Could not import boto3. Install ctfcli with boto3 support.") from e
+
+        s3 = boto3.client("s3")
+        response = s3.get_object(Bucket=bucket, Key=key)
+        body = response["Body"]
+        total_size = response.get("ContentLength")
+        chunk_size = max(S3ArtifactHandler._get_env_int("CTFCLI_LFS_S3_CHUNK_SIZE", 1024 * 1024), 1)
+
+        with destination.open("wb") as out:
+            if type(total_size) is int:
+                with click.progressbar(length=total_size, label=f"Downloading {source}") as progress:
+                    while True:
+                        chunk = body.read(chunk_size)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        progress.update(len(chunk))
+            else:
+                while True:
+                    chunk = body.read(chunk_size)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+
+
 def fetch_artifact(source: str, destination: Path) -> None:
-    handlers = [HttpArtifactHandler]
+    handlers = [HttpArtifactHandler, S3ArtifactHandler]
 
     for handler in handlers:
         if handler.supports(source):
